@@ -37,57 +37,92 @@
 (defun consult-flymake--candidates (diags)
   "Return Flymake errors from DIAGS as formatted candidates.
 DIAGS should be a list of diagnostics as returned from `flymake-diagnostics'."
-  (let* ((diags
-          (mapcar
-           (lambda (diag)
-             (let ((buffer (flymake-diagnostic-buffer diag))
-                   (type (flymake-diagnostic-type diag)))
-               (when (buffer-live-p buffer)
-                 (with-current-buffer buffer
-                   (save-excursion
-                     (without-restriction
-                       (goto-char (flymake-diagnostic-beg diag))
-                       (list (buffer-name buffer)
-                             (line-number-at-pos)
-                             type
-                             (flymake-diagnostic-text diag)
-                             (point-marker)
-                             (flymake-diagnostic-end diag)
-                             (pcase (flymake--lookup-type-property type 'flymake-category)
-                               ('flymake-error ?e)
-                               ('flymake-warning ?w)
-                               (_ ?n)))))))))
-           diags))
-         (diags (or (delq nil diags)
-                    (user-error "No flymake errors (Status: %s)"
-                                (if (seq-difference (flymake-running-backends)
-                                                    (flymake-reporting-backends))
-                                    'running 'finished))))
-         (buffer-width (cl-loop for x in diags maximize (length (nth 0 x))))
-         (line-width (cl-loop for x in diags maximize (length (number-to-string (nth 1 x)))))
-         (fmt (format "%%-%ds %%-%dd %%-7s %%s" buffer-width line-width)))
-    (mapcar
-     (pcase-lambda (`(,buffer ,line ,type ,text ,beg ,end ,narrow))
-       (propertize (format fmt buffer line
-                           (propertize (format "%s" (flymake--lookup-type-property
-                                                     type 'flymake-type-name type))
-                                       'face (flymake--lookup-type-property
-                                              type 'mode-line-face 'flymake-error))
-                           text)
-                   'consult--candidate (list beg (cons 0 (- end beg)))
-                   'consult--type narrow))
-     ;; Sort by buffer, severity and position.
-     (sort diags
-           (pcase-lambda (`(,b1 _ ,t1 _ ,m1 _) `(,b2 _ ,t2 _ ,m2 _))
-             (let ((s1 (flymake--severity t1))
-                   (s2 (flymake--severity t2)))
-               (or
-                (string-lessp b1 b2)
-                (and (string-equal b1 b2)
-                     (or
-                      (> s1 s2)
-                      (and (= s1 s2)
-                           (< m1 m2)))))))))))
+  (cl-loop
+   for diag in diags
+   for buffer = (flymake-diagnostic-buffer diag)
+   for file = (if (bufferp buffer)
+                  (buffer-file-name buffer)
+                buffer)
+   for (line . col) =
+   (cond* (;; has live overlay, use overlay for position
+           (buffer-live-p buffer)
+           (with-current-buffer buffer
+             (save-excursion
+               (without-restriction
+                 (goto-char (flymake-diagnostic-beg diag))
+                 (cons (line-number-at-pos)
+                       (- (point)
+                          (line-beginning-position)))))))
+         (;; diagnostic not annotated, maybe foreign, check for cons
+          (match* (cons line col) (flymake-diagnostic-beg diag))
+          (cons line (1- col)))
+         (;; may still be a valid foreign diagnostic
+          (match* (cons line col) (flymake--diag-orig-beg diag))
+          (cons line (1- col))))
+   for type = (flymake-diagnostic-type diag)
+   when (and line col) maximize (length (file-name-nondirectory file)) into buffer-width
+   when (and line col) maximize (length (number-to-string line)) into line-width
+   when (and line col) collect
+   (list (file-name-nondirectory file)
+         file
+         line
+         col
+         type
+         (flymake-diagnostic-oneliner diag t)
+         (pcase (flymake--lookup-type-property type 'flymake-category)
+           ('flymake-error ?e)
+           ('flymake-warning ?w)
+           (_ ?n)))
+   into diags
+   finally return
+   (if diags
+       (let ((fmt (format "%%-%ds %%-%dd %%-7s %%s" buffer-width line-width)))
+         (message "%d and %d" buffer-width line-width)
+         (mapcar
+           (pcase-lambda (`(,buffer ,file ,line ,col ,type ,text ,narrow))
+             (propertize (format fmt buffer line
+                                 (propertize (format "%s" (flymake--lookup-type-property
+                                                           type 'flymake-type-name type))
+                                             'face (flymake--lookup-type-property
+                                                    type 'mode-line-face 'flymake-error))
+                                 text)
+                         'consult--candidate (list file line col)
+                         'consult--type narrow))
+           ;; Sort by buffer, severity and position.
+           (sort diags
+                 (pcase-lambda (`(,b1 _ ,l1 ,c1 ,t1 _ _) `(,b2 _ ,l2 ,c2 ,t2 _ _))
+                   (let ((s1 (flymake--severity t1))
+                         (s2 (flymake--severity t2)))
+                     (or (string-lessp b1 b2)
+                         (and (string-equal b1 b2)
+                              (or (> s1 s2)
+                                  (and (= s1 s2)
+                                       (or (< l1 l2)
+                                           (and (= l1 l2)
+                                                (< c1 c2))))))))))))
+     (user-error "No flymake errors (Status: %s)"
+                 (if (seq-difference (flymake-running-backends)
+                                     (flymake-reporting-backends))
+                     'running 'finished)))))
+
+(defun consult--flymake-position (cand &optional find-file)
+  (pcase cand
+    (`(,file ,line ,col)
+     (consult--marker-from-line-column
+       (funcall (or find-file #'consult--file-action) file)
+       line col))))
+
+(defun consult--flymake-state ()
+  "Flymake state function."
+  (let ((open (consult--temporary-files))
+        (jump (consult--jump-state)))
+    (lambda (action cand)
+      (unless cand
+        (funcall open))
+      (funcall jump action (consult--flymake-position
+                            cand
+                            (unless (eq action 'return) open))))))
+
 
 ;;;###autoload
 (defun consult-flymake (&optional project)
@@ -109,7 +144,7 @@ buffers in the current project instead of just the current buffer."
    :group (consult--type-group consult-flymake--narrow)
    :narrow (consult--type-narrow consult-flymake--narrow)
    :lookup #'consult--lookup-candidate
-   :state (consult--jump-state)))
+   :state (consult--flymake-state)))
 
 (provide 'consult-flymake)
 ;;; consult-flymake.el ends here
